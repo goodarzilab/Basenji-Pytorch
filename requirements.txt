@@ -1,0 +1,8 @@
+matplotlib==3.3.4
+numpy==1.21.4
+pyBigWig==0.3.18
+ray==1.9.2
+scikit_learn==1.0.2
+scipy==1.6.2
+torch==1.9.1+cu111
+torchsummary==1.5.1
