@@ -11,7 +11,7 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from torch.cuda.amp import autocast
 
 from torchsummary import summary
-from sklearn.metrics import r2_score
+from sklearn.metrics import r2_score, precision_score, f1_score
 
 from ray import tune
 
@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 import pyBigWig
 from scipy.sparse import csc_matrix
 import math 
+from copy import deepcopy
 
 class DNA_Iter(Dataset):
     '''
@@ -107,6 +108,126 @@ class DNA_Iter(Dataset):
         ynew = csc_matrix((data, (rows, cols)), shape=(N, M), dtype=np.uint8)
         return ynew.toarray()[:, :4]
 
+class Toy_Dataset(Dataset):
+    def __init__(self, input_name, target_window, num_targets=1, switch=False):
+        self.target_window = target_window
+        self.seq = self.read_memmap_input(input_name)
+
+        self.target_window = target_window
+        self.nucs = np.arange(6.)
+        self.len = (int(self.seq.shape[0] / (self.target_window)))
+        self.switch = switch 
+        self.switch_func = np.vectorize(lambda x: x + 1 if (x % 2 == 0) else x - 1)
+        self.num_targets = num_targets
+        self.motif_str = '202131' 
+    
+    def __len__(self):
+        return self.len 
+
+    def __getitem__(self, idx): 
+        seq_subset = self.seq[idx*self.target_window:(idx+1)*self.target_window]
+        if self.switch: 
+            seq_subset = self.switch_func(list(reversed(seq_subset)))
+        repl_seq = self.repl_motif(seq_subset, self.motif_str)
+        ins_seq, rand_ids = self.insert_motif(repl_seq, self.motif_str)
+        targets = self.make_targets(rand_ids)
+        dta = self.get_csc_matrix(ins_seq)
+        return torch.tensor(dta), targets
+
+    def read_numpy_input(self, np_gq_name):
+        seq = np.load(np_gq_name)
+        return seq
+
+    def read_memmap_input(self, mmap_name):
+        seq = np.memmap(mmap_name, dtype='float32',  mode = 'r+') 
+        return seq
+
+    def get_csc_matrix(self, seq_subset):
+        N, M = len(seq_subset), len(self.nucs)
+        dtype = np.uint8
+        rows = np.arange(N)
+        cols = seq_subset
+        data = np.ones(N, dtype=dtype)
+        ynew = csc_matrix((data, (rows, cols)), shape=(N, M), dtype=dtype)
+        return ynew.toarray()[:, :4]
+
+    def calc_mean_lst(self, lst, n):
+        return np.array([np.mean(lst[i:i + n]) for i in range(int(len(lst)/n))])
+
+    
+    def slice_arr(self, idx, tgt_mmap, num_targets):
+        return torch.tensor(np.nan_to_num(tgt_mmap[idx::int(tgt_mmap.shape[0] / num_targets)].reshape(num_targets, 1)))
+
+    def get_stacked_means(self, idx, tgt_mmap, num_targets):
+        vals = map(functools.partial(self.slice_arr, tgt_mmap=tgt_mmap, num_targets=num_targets), np.arange(idx, idx+128))
+        stacked_means = torch.stack(list(map(sum, zip(*vals)))) / num_targets
+        return stacked_means
+
+    def get_targets(self, idx, tgt_mmap_cl, tgt_mmap_pdx, num_targets_cl, num_targets_pdx):
+        stacked_means_cl = self.get_stacked_means(idx, tgt_mmap_cl, num_targets_cl)
+        stacked_means_pdx = self.get_stacked_means(idx, tgt_mmap_pdx, num_targets_pdx)
+        stacked_full = torch.cat((stacked_means_cl, stacked_means_pdx)).view(stacked_means_cl.shape[0] + stacked_means_pdx.shape[0])
+        return stacked_full
+    
+    def find_str(self, rand_lst_str, motif_lst_str):
+        return rand_lst_str.find(motif_lst_str)
+
+    def count_substr(self, rand_lst_str, motif_lst_str):
+        upd_str = rand_lst_str
+        count = 0
+        while True:
+            ind = self.find_str(upd_str, motif_lst_str)
+            if ind != -1:         
+                upd_str = upd_str[ind + len(motif_lst_str):]
+                count += 1
+            else: 
+                break
+        return count 
+    
+    def return_ids(self, test_str, motif_str):
+        try:
+            ind_found = np.hstack([[m.start() + i] for m in re.finditer(motif_str, test_str) for i in range(len(motif_str))])
+        except: 
+            ind_found = None
+        return ind_found
+
+    def repl_motif(self, seq, motif_str):
+        seq_copy = deepcopy(seq)
+        ids = self.return_ids("".join([str(int(s)) for s in seq]), motif_str)
+        subseq = seq[ids]
+        np.random.shuffle(subseq)
+        seq_copy[ids] = subseq
+        return seq_copy
+
+
+    def insert_motif(self, seq, motif_str):
+        ids_arr = np.arange(0, len(seq)-len(motif_str), len(motif_str))
+        ids_num = int(len(seq) * .001 / len(motif_str)) 
+#         ids_num = int(len(seq) * .008 / len(motif_str)) 
+#         ids_num = int(len(seq) * 0.2 / len(motif_str)) 
+
+        rand_ids = np.random.choice(ids_arr, size=ids_num, replace=False)
+        rand_ids.sort()
+
+        arr = np.arange(6)
+        full_ids = np.array([arr + rand_ind for rand_ind in rand_ids]).flatten()
+        motif_str_fl = [float(el) for el in motif_str]
+
+        seq[full_ids] = np.array([motif_str_fl for i in range(len(rand_ids))]).flatten()
+        return seq, rand_ids
+
+    def make_targets(self, rand_ids):
+        diff_ids = np.diff(rand_ids)
+        bins = np.arange(0, self.target_window, 128)
+        bin_indices = np.digitize(rand_ids[np.where(diff_ids >= 1024)], bins) 
+#         bin_indices = np.digitize(rand_ids[np.where(diff_ids >= 2048)], bins) 
+#         bin_indices = np.digitize(rand_ids[np.where(diff_ids >= 160)], bins) 
+
+        targets = torch.zeros(len(bins))
+        targets[bin_indices] = 1
+
+        return targets
+
 
 
 class Trainer(nn.Module):
@@ -117,16 +238,16 @@ class Trainer(nn.Module):
         model (pytoch model) - a predefined model 
         batch_size (int) - the batch size, pulled from the parameter dictionary
         num_targets (int) - the number of targets that the model is trained on, pulled from the parameter dictionary
-        train_losses, valid_losses, train_Rs, valid_Rs, train_R2, valid_R2 (arrs) - arrays that keep track of the loss, Pearson R and R2 
+        train_losses, valid_losses, train_eval_metric_1, valid_eval_metric_1, train_eval_metric_2, valid_eval_metric_2 (arrs) - arrays that keep track of the loss, Pearson R and R2 
         train_losses_ind (arr) - array that keeps track of individual losses for each target 
     '''
-    def __init__(self, param_vals, model, memmap_data_contigs_dir, memmap_data_targets_dir_cl, memmap_data_targets_dir_pdx):
+    def __init__(self, param_vals, model, memmap_data_contigs_dir, memmap_data_targets_dir_cl, memmap_data_targets_dir_pdx, mode='regression'):
         super(Trainer, self).__init__()
     
         self.param_vals = param_vals
         self.model = model 
-        
-        self.train_losses, self.valid_losses, self.train_Rs, self.valid_Rs, self.train_R2, self.valid_R2 = [], [], [], [], [], []
+        self.mode = mode
+        self.train_losses, self.valid_losses, self.train_eval_metric_1, self.valid_eval_metric_1, self.train_eval_metric_2, self.valid_eval_metric_2 = [], [], [], [], [], []
         self.train_losses_ind = [[] for i in range(self.param_vals.get('num_targets', 1))]
         self.optim_step = 0
         
@@ -134,7 +255,7 @@ class Trainer(nn.Module):
         self.num_targets = self.param_vals.get('num_targets', 1)
         self.make_optimizer()
         self.init_loss()
-        self.make_dsets(memmap_data_contigs_dir, memmap_data_targets_dir_cl, memmap_data_targets_dir_pdx)
+        self.make_dsets(memmap_data_contigs_dir, memmap_data_targets_dir_cl, memmap_data_targets_dir_pdx, mode=mode)
         print ('init dsets')
 
     def make_optimizer(self): 
@@ -150,7 +271,7 @@ class Trainer(nn.Module):
         if self.param_vals["optimizer"]=="Adagrad":
             self.optimizer = optim.Adagrad(self.model.parameters(), lr=self.param_vals["init_lr"], weight_decay = self.param_vals["weight_decay"])
     
-    def make_dsets(self, input_files_dir, target_files_dir_cl, target_files_dir_pdx):
+    def make_dsets(self, input_files_dir, target_files_dir_cl, target_files_dir_pdx, mode):
         '''
         Initizes the datasets
         '''
@@ -175,23 +296,36 @@ class Trainer(nn.Module):
         train_target_pdx_files = targets_pdx_list[:int(len(targets_pdx_list)*cut)]
 
         # concatenate the datasets defined for each chromosome 
-        self.valid_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, val_input_files[i]), 
-                                                  os.path.join(target_files_dir_cl, val_target_files_cl[i]), 
-                                                  os.path.join(target_files_dir_pdx, val_target_files_pdx[i]), 
-                                                  self.param_vals.get('target_window', 128)
-                                                  ) for i in range(len(val_input_files))])
+        if self.mode=='classification': 
+            self.valid_dset = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, val_input_files[i]),
+                                                             self.param_vals.get('target_window', 128)
+                                                            ) for i in range(len(val_input_files))])
         
-        self.training_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), 
-                                                     os.path.join(target_files_dir_cl, train_target_cl_files[i]), 
-                                                     os.path.join(target_files_dir_pdx, train_target_pdx_files[i]), 
-                                                     self.param_vals.get('target_window', 128),
-                                                     switch=False) for i in range(len(train_input_files))])
-        
-        self.training_dset_augm = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), 
-                                                          os.path.join(target_files_dir_cl, train_target_cl_files[i]),  
-                                                          os.path.join(target_files_dir_pdx, train_target_pdx_files[i]), 
-                                                          self.param_vals.get('target_window', 128),
-                                                          switch=True) for i in range(len(train_input_files))])
+            self.training_dset = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, train_input_files[i]), 
+                                                self.param_vals.get('target_window', 128),
+                                                         switch=False) for i in range(len(train_input_files))])
+
+            self.training_dset_augm = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, train_input_files[i]),
+                                                                 self.param_vals.get('target_window', 128),
+                                                              switch=True) for i in range(len(train_input_files))])
+        else: 
+            self.valid_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, val_input_files[i]), 
+                                                      os.path.join(target_files_dir_cl, val_target_files_cl[i]), 
+                                                      os.path.join(target_files_dir_pdx, val_target_files_pdx[i]), 
+                                                      self.param_vals.get('target_window', 128)
+                                                      ) for i in range(len(val_input_files))])
+
+            self.training_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), 
+                                                         os.path.join(target_files_dir_cl, train_target_cl_files[i]), 
+                                                         os.path.join(target_files_dir_pdx, train_target_pdx_files[i]), 
+                                                         self.param_vals.get('target_window', 128),
+                                                         switch=False) for i in range(len(train_input_files))])
+
+            self.training_dset_augm = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), 
+                                                              os.path.join(target_files_dir_cl, train_target_cl_files[i]),  
+                                                              os.path.join(target_files_dir_pdx, train_target_pdx_files[i]), 
+                                                              self.param_vals.get('target_window', 128),
+                                                              switch=True) for i in range(len(train_input_files))])
 
         
     def make_loaders(self, augm):
@@ -232,7 +366,9 @@ class Trainer(nn.Module):
             self.loss_fn = F.mse_loss
         if self.param_vals["loss"]=="poisson":
             self.loss_fn = torch.nn.PoissonNLLLoss(log_input=False, reduction=reduction)
-    
+        if self.param_vals["loss"]=="bce":
+            self.loss_fn = torch.nn.BCEWithLogitsLoss()
+
     def get_input(self, batch):
         '''
         Returns X and y for each batch returned by a dataloader. 
@@ -247,7 +383,8 @@ class Trainer(nn.Module):
         if X_reshape.shape[-1] == self.param_vals.get('seq_len', 128*128*8):
             # reshape the target into [batch_size, 1024, num_targets]
             y =  torch.stack(torch.chunk(y, batch_size, dim=0)).view(batch_size, 1024, num_targets).type(torch.FloatTensor).cuda()
-            y = F.normalize(y, dim=1)            
+            if self.mode != 'classification': 
+                y = F.normalize(y, dim=1)            
             return X_reshape, y
         else:
             return np.array([0]), np.array([0])
@@ -258,7 +395,10 @@ class Trainer(nn.Module):
         '''
         for i in range(num_targets):
             ys = y[:, :, i].flatten().cpu().numpy()
-            preds = out[:, :, i].flatten().detach().cpu().numpy()
+            if self.mode == 'classification': 
+                preds = torch.sigmoid(out).cpu().detach().numpy()
+            else: 
+                preds = out[:, :, i].flatten().detach().cpu().numpy()
             plt.plot(np.arange(len(ys.flatten())), ys.flatten(), label='True')
             plt.plot(np.arange(len(preds.flatten())), preds.flatten(), label='Predicted', alpha=0.5)
             plt.legend()
@@ -274,6 +414,8 @@ class Trainer(nn.Module):
                 augm = False
             else: 
                 augm = True
+            if self.mode == 'classification': 
+                augm = False
             train_loader, val_loader = self.make_loaders(augm)
             print(len(train_loader), len(val_loader))
             for batch_idx, batch in enumerate(train_loader):
@@ -306,10 +448,11 @@ class Trainer(nn.Module):
                         self.eval_step(x, y, print_res, plot_res, epoch, batch_idx, val_loader) 
                         print_res, plot_res = False, False 
 
-            train_arrs = np.array([self.train_losses, self.train_Rs, self.train_R2])
-            val_arrs = np.array([self.valid_losses, self.valid_Rs, self.valid_R2])
+            train_arrs = np.array([self.train_losses, self.train_eval_metric_1, self.train_eval_metric_2])
+            val_arrs = np.array([self.valid_losses, self.valid_eval_metric_1, self.valid_eval_metric_2])
             self.plot_metrics(epoch+1, train_arrs, val_arrs)
-            self.plot_ind_loss(epoch+1, self.train_losses_ind)
+            if self.num_targets > 1: 
+                self.plot_ind_loss(epoch+1, self.train_losses_ind)
 
 
 
@@ -329,8 +472,13 @@ class Trainer(nn.Module):
             # if the regularization is required, update the loss
             if self.param_vals.get('lambda_param', None): 
                 loss = self.regularize_loss(self.param_vals["lambda_param"], self.param_vals["ltype"], self.model, loss)
-        # calculate the Pearson R and R2 
-        R, r2 = self.calc_R_R2(y, out, self.num_targets)
+        if self.mode == 'classification': 
+            # calculate the precision and f1 score for classification
+            pres, f1 = self.calc_pres_f1(y, out)
+
+        else: 
+            # calculate the Pearson R and R2 for regression
+            R, r2 = self.calc_R_R2(y, out, self.num_targets)
         
         # backpropagate the loss
         loss.backward()
@@ -345,12 +493,23 @@ class Trainer(nn.Module):
         
         # record the values for loss, Pearson R, and R2
         self.train_losses.append(loss.data.item())
-        self.train_Rs.append(R.item())
-        self.train_R2.append(r2.item())
+        if self.mode == 'classification': 
+            self.train_eval_metric_1.append(pres)
+            self.train_eval_metric_2.append(f1)
+        else: 
+            self.train_eval_metric_1.append(R.item())
+            self.train_eval_metric_2.append(r2.item())
+            
+
         if print_res: 
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tR: {:.6f}\tR2: {:.6f}'.format(
-                          epoch, batch_idx, len(train_loader), int(100. * batch_idx / len(train_loader)),
-                          loss.item(), R.item(), r2.item()))
+            if self.mode == 'classification':
+                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tPres: {:.6f}\tF1 Score: {:.6f}'.format(
+                              epoch, batch_idx, len(train_loader), int(100. * batch_idx / len(train_loader)),
+                              loss.item(), pres, f1))                
+            else: 
+                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tR: {:.6f}\tR2: {:.6f}'.format(
+                              epoch, batch_idx, len(train_loader), int(100. * batch_idx / len(train_loader)),
+                              loss.item(), R.item(), r2.item()))
         if plot_res: 
             print (torch.sum(y).item(), torch.sum(out).item())
             self.plot_results(y, out, self.num_targets)
@@ -367,15 +526,33 @@ class Trainer(nn.Module):
             loss += loss_
 
 #         loss = self.loss_fn(out,y)
-        R, r2 = self.calc_R_R2(y, out, self.num_targets)
-        self.valid_losses.append(loss.data.item())
-        self.valid_Rs.append(R.item())
-        self.valid_R2.append(r2.item())                
+        if self.mode == 'classification': 
+            # calculate the precision and f1 score for classification
+            pres, f1 = self.calc_pres_f1(y, out)
+
+        else: 
+            # calculate the Pearson R and R2 for regression
+            R, r2 = self.calc_R_R2(y, out, self.num_targets)
         
+        self.valid_losses.append(loss.data.item())
+        if self.mode == 'classification': 
+            self.valid_eval_metric_1.append(pres)
+            self.valid_eval_metric_2.append(f1)                
+        else: 
+            self.valid_eval_metric_1.append(R.item())
+            self.valid_eval_metric_2.append(r2.item())                
+                            
+
         if print_res: 
-            print('Validation Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tR: {:.6f}\tR2: {:.6f}'.format(
-                          epoch, batch_idx, len(val_loader), int(100. * batch_idx / len(val_loader)),
-                          loss.item(), R.item(), r2.item()))
+            if self.mode == 'classification':
+                print('Validation Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tPres: {:.6f}\tF1 Score: {:.6f}'.format(
+                              epoch, batch_idx, len(val_loader), int(100. * batch_idx / len(val_loader)),
+                              loss.item(), pres, f1))
+            
+            else:
+                print('Validation Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tR: {:.6f}\tR2: {:.6f}'.format(
+                              epoch, batch_idx, len(val_loader), int(100. * batch_idx / len(val_loader)),
+                              loss.item(), R.item(), r2.item()))
         if plot_res: 
             self.plot_results(y, out, self.num_targets)
 
@@ -399,7 +576,10 @@ class Trainer(nn.Module):
         Plots individual losses for 4 targets side by side
         '''
 #         num_targets = self.param_vals.get('num_targets', 1)
-        num_targets = 4
+        if self.num_targets >= 4: 
+            num_targets = 4
+        else: 
+            num_targets = self.num_targets
 
         fig, axs = plt.subplots(nrows=1, ncols=num_targets+1, figsize=(15, 3))
         for i in range(num_targets):
@@ -410,7 +590,15 @@ class Trainer(nn.Module):
         plt.show()    
 
 
-        
+    def calc_pres_f1(self, y_true, y_pred): 
+        '''
+        Handles the precision and f1-score calculation
+        '''
+
+        y_true, y_pred = y_true.cpu().detach().numpy().flatten().astype(int), torch.round(y_pred).cpu().detach().numpy().flatten().astype(int)
+        f1 = f1_score(y_true, y_pred, average='macro', zero_division=1)
+        pres = precision_score(y_true, y_pred, average='macro', zero_division=1)
+        return pres, f1
         
     def calc_R_R2(self, y_true, y_pred, num_targets, device='cuda:0'):
         '''
