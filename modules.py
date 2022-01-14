@@ -128,19 +128,13 @@ class Main_Dataset(Dataset):
     def __init__(self, input_name, targets_name, num_targets, target_window, switch=False):
 
         self.target_window = target_window
-#         print (input_name, targets_name)
         self.seq = self.read_memmap_input(input_name)
         self.tgts = [self.read_memmap_input(mmap_name) 
                 for mmap_name in targets_name]
-#         self.tgt_mmap_cl = self.read_memmap_input(targets_name_cl)
-#         self.tgt_mmap_pdx = self.read_memmap_input(targets_name_pdx)
-#         print(self.seq.shape, [tgt.shape[0] / 3 for tgt in self.tgts])
         self.chrom_len = int(self.seq.shape[0])
         self.nucs = np.arange(6.)
         self.switch = switch 
         self.switch_func = np.vectorize(lambda x: x + 1 if (x % 2 == 0) else x - 1)
-#         self.num_targets_cl = 2 #23
-#         self.num_targets_pdx = 2 #14
         if not isinstance(num_targets, list):
             num_targets = [num_targets]
         self.num_targets_lst = num_targets
@@ -160,14 +154,7 @@ class Main_Dataset(Dataset):
         max_target_len = max(self.num_targets_lst)
         arr = np.arange(idx*self.target_window, (idx+1) * self.target_window)
         tgt_lst = np.arange(0, self.chrom_len*max_target_len, self.chrom_len)
-#         ids = np.array([np.split(arr, 128) + tgt for tgt in tgt_lst])
         ids = np.array([np.split(arr, self.target_window/128) + tgt for tgt in tgt_lst])
-#         print (ids.shape)
-
-        
-#         print (len(tgts))
-#         print (self.num_targets_lst, [i for i in range(len(self.tgts))])
-#         print ([self.num_targets_lst[i] for i in range(len(self.tgts))])
         stacked_targets_means = torch.cat([self.get_means(self.tgts[i], ids[:self.num_targets_lst[i]]) for i in range(len(self.tgts))])
         return torch.tensor(dta), stacked_targets_means 
 
@@ -196,7 +183,7 @@ class Main_Dataset(Dataset):
         return val
 
 class Toy_Dataset(Dataset):
-    def __init__(self, input_name, target_window, num_targets=1, switch=False):
+    def __init__(self, input_name, target_window, num_targets=1, classification_data_type='distance', switch=False):
         self.target_window = target_window
         self.seq = self.read_memmap_input(input_name)
 
@@ -207,6 +194,7 @@ class Toy_Dataset(Dataset):
         self.switch_func = np.vectorize(lambda x: x + 1 if (x % 2 == 0) else x - 1)
         self.num_targets = num_targets
         self.motif_str = '202131' 
+        self.classification_data_type = classification_data_type
     
     def __len__(self):
         return self.len 
@@ -215,9 +203,18 @@ class Toy_Dataset(Dataset):
         seq_subset = self.seq[idx*self.target_window:(idx+1)*self.target_window]
         if self.switch: 
             seq_subset = self.switch_func(list(reversed(seq_subset)))
-        repl_seq = self.repl_motif(seq_subset, self.motif_str)
-        ins_seq, rand_ids = self.insert_motif(repl_seq, self.motif_str)
-        targets = self.make_targets(rand_ids)
+        # classification_data_type=direct corresponds to the case where we assign signal to bins that have the motif
+        # classification_data_type=distance corresponds to the case where we assign signal to bins that have the motifs 
+        # at a certain distance from each other 
+
+        if self.classification_data_type == 'direct': 
+            str_found = lambda x: 0 if x == -1 else 1
+            seq_subset_str = "".join([str(int(s)) for s in np.split(seq_subset, self.target_window/128)])
+            targets = torch.tensor([str_found(find_str(subset_str, self.motif_lst_str)) for subset_str in seq_subset_str])
+        if self.classification_data_type == 'distance': 
+            repl_seq = self.repl_motif(seq_subset, self.motif_str)
+            ins_seq, rand_ids = self.insert_motif(repl_seq, self.motif_str)
+            targets = self.make_targets(rand_ids)
         dta = self.get_csc_matrix(ins_seq)
         return torch.tensor(dta), targets
 
@@ -388,15 +385,18 @@ class Trainer(nn.Module):
 
         if self.mode=='classification': 
             self.valid_dset = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, val_input_files[i]),
-                                                             self.param_vals.get('target_window', 128)
+                                                             self.param_vals.get('target_window', 128), 
+                                                classification_data_type = self.param_vals.get('classification_data_type', 'distance'),
                                                             ) for i in range(len(val_input_files))])
 
             self.training_dset = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, train_input_files[i]), 
                                                 self.param_vals.get('target_window', 128),
+            classification_data_type = self.param_vals.get('classification_data_type', 'distance'),                        
                                                          switch=False) for i in range(len(train_input_files))])
 
             self.training_dset_augm = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, train_input_files[i]),
                                                                  self.param_vals.get('target_window', 128),
+                                        classification_data_type = self.param_vals.get('classification_data_type', 'distance'), 
                                                               switch=True) for i in range(len(train_input_files))])
         else: 
 
@@ -418,64 +418,7 @@ class Trainer(nn.Module):
                                         switch=False) 
                                for i in range(len(train_input_files))])
 
-    
-#     def make_dsets(self, input_files_dir, target_files_dir_cl, target_files_dir_pdx, mode):
-#         '''
-#         Initializes the datasets
-#         '''
-#         cut = self.param_vals.get('cut', .8)
-#         np.random.seed(42)
-#         # select the files with the .dta extension
-#         chroms_list = [file.split('_')[0] for file in os.listdir(input_files_dir) if file.split('.')[-1] == 'dta']
-#         # shuffle the files
-#         np.random.shuffle(chroms_list)
-#         # create the input and target file lists for training and validation datasets 
-#         input_list = np.hstack([[file for file in os.listdir(input_files_dir) if file.split('_')[0] == chrom] for chrom in chroms_list])
-#         targets_cl_list = np.hstack([[file for file in os.listdir(target_files_dir_cl) if file.split('_')[0] == chrom] for chrom in chroms_list])
-#         targets_pdx_list = np.hstack([[file for file in os.listdir(target_files_dir_pdx) if file.split('_')[0] == chrom] for chrom in chroms_list])
-        
-#         val_input_files = input_list[int(len(input_list)*cut):]
-#         val_target_files_cl = targets_cl_list[int(len(targets_cl_list)*cut):]
-#         val_target_files_pdx = targets_pdx_list[int(len(targets_pdx_list)*cut):]
-
-        
-#         train_input_files = input_list[:int(len(input_list)*cut)]
-#         train_target_cl_files = targets_cl_list[:int(len(targets_cl_list)*cut)]
-#         train_target_pdx_files = targets_pdx_list[:int(len(targets_pdx_list)*cut)]
-
-#         # concatenate the datasets defined for each chromosome 
-#         if self.mode=='classification': 
-#             self.valid_dset = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, val_input_files[i]),
-#                                                              self.param_vals.get('target_window', 128)
-#                                                             ) for i in range(len(val_input_files))])
-        
-#             self.training_dset = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, train_input_files[i]), 
-#                                                 self.param_vals.get('target_window', 128),
-#                                                          switch=False) for i in range(len(train_input_files))])
-
-#             self.training_dset_augm = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, train_input_files[i]),
-#                                                                  self.param_vals.get('target_window', 128),
-#                                                               switch=True) for i in range(len(train_input_files))])
-#         else: 
-#             self.valid_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, val_input_files[i]), 
-#                                                       os.path.join(target_files_dir_cl, val_target_files_cl[i]), 
-#                                                       os.path.join(target_files_dir_pdx, val_target_files_pdx[i]), 
-#                                                       self.param_vals.get('target_window', 128)
-#                                                       ) for i in range(len(val_input_files))])
-
-#             self.training_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), 
-#                                                          os.path.join(target_files_dir_cl, train_target_cl_files[i]), 
-#                                                          os.path.join(target_files_dir_pdx, train_target_pdx_files[i]), 
-#                                                          self.param_vals.get('target_window', 128),
-#                                                          switch=False) for i in range(len(train_input_files))])
-
-#             self.training_dset_augm = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), 
-#                                                               os.path.join(target_files_dir_cl, train_target_cl_files[i]),  
-#                                                               os.path.join(target_files_dir_pdx, train_target_pdx_files[i]), 
-#                                                               self.param_vals.get('target_window', 128),
-#                                                               switch=True) for i in range(len(train_input_files))])
-
-        
+            
     def make_loaders(self, augm):
         '''
         Initializes three dataloaders: training, validation, and training with reversed nucleotides. 
@@ -544,6 +487,8 @@ class Trainer(nn.Module):
         '''
         if num_targets >= 6: 
             num_targets_plot = 6
+        else: 
+            num_targets_plot = num_targets
         for i in range(num_targets_plot):
             ys = y[:, :, i].flatten().cpu().numpy()
             if self.mode == 'classification': 
