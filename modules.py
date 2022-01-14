@@ -108,6 +108,93 @@ class DNA_Iter(Dataset):
         ynew = csc_matrix((data, (rows, cols)), shape=(N, M), dtype=np.uint8)
         return ynew.toarray()[:, :4]
 
+class Main_Dataset(Dataset):
+    '''
+    A Dataset class. 
+    For each chromosome, opens the input and target file, 
+    with each __getitem__ call, returns one-hot encoded input and target averaged out over a given window - default is 128. 
+    Attributes:         
+        target_window (int) - size of the slice from the input and target arrays. Default is 128. 
+        seq (mmap) - input file
+        tgts_mmap_cl (lst of mmaps) - a list of memory maps corresponding to each target in the target lst 
+        chrom_len (int) - length of the selected chromosome
+        nucs (arr) - nucleotides encoded to ints, N -> 5
+        switch (bool) - if True, the nucleotide sequence gets reversed 
+        switch_func (func) - vectorized function to reverse the nuc sequence 
+        num_targets_lst (int) - a list with the number(s) of targets 
+        
+
+'''
+    def __init__(self, input_name, targets_name, num_targets, target_window, switch=False):
+
+        self.target_window = target_window
+#         print (input_name, targets_name)
+        self.seq = self.read_memmap_input(input_name)
+        self.tgts = [self.read_memmap_input(mmap_name) 
+                for mmap_name in targets_name]
+#         self.tgt_mmap_cl = self.read_memmap_input(targets_name_cl)
+#         self.tgt_mmap_pdx = self.read_memmap_input(targets_name_pdx)
+#         print(self.seq.shape, [tgt.shape[0] / 3 for tgt in self.tgts])
+        self.chrom_len = int(self.seq.shape[0])
+        self.nucs = np.arange(6.)
+        self.switch = switch 
+        self.switch_func = np.vectorize(lambda x: x + 1 if (x % 2 == 0) else x - 1)
+#         self.num_targets_cl = 2 #23
+#         self.num_targets_pdx = 2 #14
+        if not isinstance(num_targets, list):
+            num_targets = [num_targets]
+        self.num_targets_lst = num_targets
+        
+    def __len__(self):
+        # length of the dataset is defined as the ration between the full length of the input and the target window
+        return int(self.seq.shape[0] / (self.target_window))
+
+    def __getitem__(self, idx): 
+        # slice the input from the memory map
+        seq_subset = self.seq[idx*self.target_window:(idx+1)*self.target_window]
+        # if switch=True, reverse the nuc sequence
+        if self.switch: 
+            seq_subset = self.switch_func(list(reversed(seq_subset)))
+        # one-hot encode the input, here compressed row format -> sparse matrix conversion is used
+        dta = self.get_csc_matrix(seq_subset)
+        max_target_len = max(self.num_targets_lst)
+        arr = np.arange(idx*self.target_window, (idx+1) * self.target_window)
+        tgt_lst = np.arange(0, self.chrom_len*max_target_len, self.chrom_len)
+#         ids = np.array([np.split(arr, 128) + tgt for tgt in tgt_lst])
+        ids = np.array([np.split(arr, self.target_window/128) + tgt for tgt in tgt_lst])
+#         print (ids.shape)
+
+        
+#         print (len(tgts))
+#         print (self.num_targets_lst, [i for i in range(len(self.tgts))])
+#         print ([self.num_targets_lst[i] for i in range(len(self.tgts))])
+        stacked_targets_means = torch.cat([self.get_means(self.tgts[i], ids[:self.num_targets_lst[i]]) for i in range(len(self.tgts))])
+        return torch.tensor(dta), stacked_targets_means 
+
+    def read_memmap_input(self, mmap_name):
+        '''
+        Loads a memory map input
+        '''
+        seq = np.memmap(mmap_name, dtype='float32',  mode = 'r+') #, shape=(2, self.chrom_seq[self.chrom]))
+        return seq
+
+    def get_csc_matrix(self, seq_subset):
+        '''
+        Converts a compressed row format data to a sparse matrix
+        ''' 
+        N, M = len(seq_subset), len(self.nucs)
+        rows, cols = np.arange(N), seq_subset
+        data = np.ones(N, dtype=np.uint8)
+        ynew = csc_matrix((data, (rows, cols)), shape=(N, M), dtype=np.uint8)
+        return ynew.toarray()[:, :4]
+    
+    def get_means(self, tgt, ids):
+        val = torch.mean(torch.tensor(np.nan_to_num(np.take(tgt, ids))), dim=-1)
+        if self.switch: 
+            vals = torch.flip(vals, dims=[0, 1])
+#         print (val.shape)
+        return val
+
 class Toy_Dataset(Dataset):
     def __init__(self, input_name, target_window, num_targets=1, switch=False):
         self.target_window = target_window
@@ -202,9 +289,9 @@ class Toy_Dataset(Dataset):
 
     def insert_motif(self, seq, motif_str):
         ids_arr = np.arange(0, len(seq)-len(motif_str), len(motif_str))
-        ids_num = int(len(seq) * .001 / len(motif_str)) 
+#         ids_num = int(len(seq) * .001 / len(motif_str)) 
 #         ids_num = int(len(seq) * .008 / len(motif_str)) 
-#         ids_num = int(len(seq) * 0.2 / len(motif_str)) 
+        ids_num = int(len(seq) * 0.2 / len(motif_str)) 
 
         rand_ids = np.random.choice(ids_arr, size=ids_num, replace=False)
         rand_ids.sort()
@@ -219,9 +306,9 @@ class Toy_Dataset(Dataset):
     def make_targets(self, rand_ids):
         diff_ids = np.diff(rand_ids)
         bins = np.arange(0, self.target_window, 128)
-        bin_indices = np.digitize(rand_ids[np.where(diff_ids >= 1024)], bins) 
+#         bin_indices = np.digitize(rand_ids[np.where(diff_ids >= 1024)], bins) 
 #         bin_indices = np.digitize(rand_ids[np.where(diff_ids >= 2048)], bins) 
-#         bin_indices = np.digitize(rand_ids[np.where(diff_ids >= 160)], bins) 
+        bin_indices = np.digitize(rand_ids[np.where(diff_ids >= 160)], bins) 
 
         targets = torch.zeros(len(bins))
         targets[bin_indices] = 1
@@ -241,21 +328,30 @@ class Trainer(nn.Module):
         train_losses, valid_losses, train_eval_metric_1, valid_eval_metric_1, train_eval_metric_2, valid_eval_metric_2 (arrs) - arrays that keep track of the loss, Pearson R and R2 
         train_losses_ind (arr) - array that keeps track of individual losses for each target 
     '''
-    def __init__(self, param_vals, model, memmap_data_contigs_dir, memmap_data_targets_dir_cl, memmap_data_targets_dir_pdx, mode='regression'):
+    def __init__(self, param_vals, model, input_files_dir, target_files_dir):
         super(Trainer, self).__init__()
     
         self.param_vals = param_vals
         self.model = model 
-        self.mode = mode
+        self.mode = self.param_vals.get('mode', 'regression')
         self.train_losses, self.valid_losses, self.train_eval_metric_1, self.valid_eval_metric_1, self.train_eval_metric_2, self.valid_eval_metric_2 = [], [], [], [], [], []
-        self.train_losses_ind = [[] for i in range(self.param_vals.get('num_targets', 1))]
+        
+        num_targets = self.param_vals.get('num_targets', 1)
+        if isinstance(num_targets, list): 
+            self.num_targets_lst = num_targets
+            self.num_targets = np.sum(num_targets)
+        else: 
+            self.num_targets_lst = [num_targets]
+            self.num_targets = num_targets
+        
+        self.train_losses_ind = [[] for i in range(self.num_targets)]
         self.optim_step = 0
         
         self.batch_size = self.param_vals.get('batch_size', 8)
-        self.num_targets = self.param_vals.get('num_targets', 1)
+#         self.num_targets = self.param_vals.get('num_targets', 1)
         self.make_optimizer()
         self.init_loss()
-        self.make_dsets(memmap_data_contigs_dir, memmap_data_targets_dir_cl, memmap_data_targets_dir_pdx, mode=mode)
+        self.make_dsets(input_files_dir, target_files_dir, self.num_targets_lst, mode=self.mode)
         print ('init dsets')
 
     def make_optimizer(self): 
@@ -271,36 +367,30 @@ class Trainer(nn.Module):
         if self.param_vals["optimizer"]=="Adagrad":
             self.optimizer = optim.Adagrad(self.model.parameters(), lr=self.param_vals["init_lr"], weight_decay = self.param_vals["weight_decay"])
     
-    def make_dsets(self, input_files_dir, target_files_dir_cl, target_files_dir_pdx, mode):
-        '''
-        Initizes the datasets
-        '''
+    def make_dsets(self, input_files_dir, target_files_dir, num_targets, mode):
         cut = self.param_vals.get('cut', .8)
         np.random.seed(42)
-        # select the files with the .dta extension
         chroms_list = [file.split('_')[0] for file in os.listdir(input_files_dir) if file.split('.')[-1] == 'dta']
         # shuffle the files
         np.random.shuffle(chroms_list)
-        # create the input and target file lists for training and validation datasets 
         input_list = np.hstack([[file for file in os.listdir(input_files_dir) if file.split('_')[0] == chrom] for chrom in chroms_list])
-        targets_cl_list = np.hstack([[file for file in os.listdir(target_files_dir_cl) if file.split('_')[0] == chrom] for chrom in chroms_list])
-        targets_pdx_list = np.hstack([[file for file in os.listdir(target_files_dir_pdx) if file.split('_')[0] == chrom] for chrom in chroms_list])
-        
-        val_input_files = input_list[int(len(input_list)*cut):]
-        val_target_files_cl = targets_cl_list[int(len(targets_cl_list)*cut):]
-        val_target_files_pdx = targets_pdx_list[int(len(targets_pdx_list)*cut):]
 
-        
-        train_input_files = input_list[:int(len(input_list)*cut)]
-        train_target_cl_files = targets_cl_list[:int(len(targets_cl_list)*cut)]
-        train_target_pdx_files = targets_pdx_list[:int(len(targets_pdx_list)*cut)]
 
-        # concatenate the datasets defined for each chromosome 
+        if not isinstance(target_files_dir, list): 
+            target_files_dir = [target_files_dir]
+
+        targets_list = np.array([np.hstack([[file for file in os.listdir(target_dir) if file.split('_')[0] == chrom] for chrom in chroms_list]) for target_dir in target_files_dir])
+        val_input_files = [os.path.join(input_files_dir, file) for file in input_list[int(len(input_list)*cut):]]
+        train_input_files = [os.path.join(input_files_dir, file) for file in input_list[:int(len(input_list)*cut)]]
+
+        val_target_files = np.array([[os.path.join(target_files_dir[i], target_file) for target_file in targets_list[i][int(targets_list.shape[-1]*cut):]] for i in range(targets_list.shape[0])]).T
+        train_target_files = np.array([[os.path.join(target_files_dir[i], target_file) for target_file in targets_list[i][:int(targets_list.shape[-1]*cut)]] for i in range(targets_list.shape[0])]).T
+
         if self.mode=='classification': 
             self.valid_dset = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, val_input_files[i]),
                                                              self.param_vals.get('target_window', 128)
                                                             ) for i in range(len(val_input_files))])
-        
+
             self.training_dset = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, train_input_files[i]), 
                                                 self.param_vals.get('target_window', 128),
                                                          switch=False) for i in range(len(train_input_files))])
@@ -309,23 +399,81 @@ class Trainer(nn.Module):
                                                                  self.param_vals.get('target_window', 128),
                                                               switch=True) for i in range(len(train_input_files))])
         else: 
-            self.valid_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, val_input_files[i]), 
-                                                      os.path.join(target_files_dir_cl, val_target_files_cl[i]), 
-                                                      os.path.join(target_files_dir_pdx, val_target_files_pdx[i]), 
-                                                      self.param_vals.get('target_window', 128)
-                                                      ) for i in range(len(val_input_files))])
 
-            self.training_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), 
-                                                         os.path.join(target_files_dir_cl, train_target_cl_files[i]), 
-                                                         os.path.join(target_files_dir_pdx, train_target_pdx_files[i]), 
-                                                         self.param_vals.get('target_window', 128),
-                                                         switch=False) for i in range(len(train_input_files))])
+            self.valid_dset = ConcatDataset([Main_Dataset(val_input_files[i], 
+                                        val_target_files[i], num_targets,
+                                        self.param_vals.get('target_window', 128),
+                                        switch=False) 
+                               for i in range(len(val_input_files))])
 
-            self.training_dset_augm = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), 
-                                                              os.path.join(target_files_dir_cl, train_target_cl_files[i]),  
-                                                              os.path.join(target_files_dir_pdx, train_target_pdx_files[i]), 
-                                                              self.param_vals.get('target_window', 128),
-                                                              switch=True) for i in range(len(train_input_files))])
+            self.training_dset = ConcatDataset([Main_Dataset(train_input_files[i], 
+                            train_target_files[i], num_targets,
+                            self.param_vals.get('target_window', 128),
+                            switch=False) 
+                   for i in range(len(train_input_files))])
+
+            self.training_dset_augm = ConcatDataset([Main_Dataset(train_input_files[i], 
+                                        train_target_files[i], num_targets,
+                                        self.param_vals.get('target_window', 128),
+                                        switch=False) 
+                               for i in range(len(train_input_files))])
+
+    
+#     def make_dsets(self, input_files_dir, target_files_dir_cl, target_files_dir_pdx, mode):
+#         '''
+#         Initializes the datasets
+#         '''
+#         cut = self.param_vals.get('cut', .8)
+#         np.random.seed(42)
+#         # select the files with the .dta extension
+#         chroms_list = [file.split('_')[0] for file in os.listdir(input_files_dir) if file.split('.')[-1] == 'dta']
+#         # shuffle the files
+#         np.random.shuffle(chroms_list)
+#         # create the input and target file lists for training and validation datasets 
+#         input_list = np.hstack([[file for file in os.listdir(input_files_dir) if file.split('_')[0] == chrom] for chrom in chroms_list])
+#         targets_cl_list = np.hstack([[file for file in os.listdir(target_files_dir_cl) if file.split('_')[0] == chrom] for chrom in chroms_list])
+#         targets_pdx_list = np.hstack([[file for file in os.listdir(target_files_dir_pdx) if file.split('_')[0] == chrom] for chrom in chroms_list])
+        
+#         val_input_files = input_list[int(len(input_list)*cut):]
+#         val_target_files_cl = targets_cl_list[int(len(targets_cl_list)*cut):]
+#         val_target_files_pdx = targets_pdx_list[int(len(targets_pdx_list)*cut):]
+
+        
+#         train_input_files = input_list[:int(len(input_list)*cut)]
+#         train_target_cl_files = targets_cl_list[:int(len(targets_cl_list)*cut)]
+#         train_target_pdx_files = targets_pdx_list[:int(len(targets_pdx_list)*cut)]
+
+#         # concatenate the datasets defined for each chromosome 
+#         if self.mode=='classification': 
+#             self.valid_dset = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, val_input_files[i]),
+#                                                              self.param_vals.get('target_window', 128)
+#                                                             ) for i in range(len(val_input_files))])
+        
+#             self.training_dset = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, train_input_files[i]), 
+#                                                 self.param_vals.get('target_window', 128),
+#                                                          switch=False) for i in range(len(train_input_files))])
+
+#             self.training_dset_augm = ConcatDataset([Toy_Dataset(os.path.join(input_files_dir, train_input_files[i]),
+#                                                                  self.param_vals.get('target_window', 128),
+#                                                               switch=True) for i in range(len(train_input_files))])
+#         else: 
+#             self.valid_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, val_input_files[i]), 
+#                                                       os.path.join(target_files_dir_cl, val_target_files_cl[i]), 
+#                                                       os.path.join(target_files_dir_pdx, val_target_files_pdx[i]), 
+#                                                       self.param_vals.get('target_window', 128)
+#                                                       ) for i in range(len(val_input_files))])
+
+#             self.training_dset = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), 
+#                                                          os.path.join(target_files_dir_cl, train_target_cl_files[i]), 
+#                                                          os.path.join(target_files_dir_pdx, train_target_pdx_files[i]), 
+#                                                          self.param_vals.get('target_window', 128),
+#                                                          switch=False) for i in range(len(train_input_files))])
+
+#             self.training_dset_augm = ConcatDataset([DNA_Iter(os.path.join(input_files_dir, train_input_files[i]), 
+#                                                               os.path.join(target_files_dir_cl, train_target_cl_files[i]),  
+#                                                               os.path.join(target_files_dir_pdx, train_target_pdx_files[i]), 
+#                                                               self.param_vals.get('target_window', 128),
+#                                                               switch=True) for i in range(len(train_input_files))])
 
         
     def make_loaders(self, augm):
@@ -367,15 +515,16 @@ class Trainer(nn.Module):
         if self.param_vals["loss"]=="poisson":
             self.loss_fn = torch.nn.PoissonNLLLoss(log_input=False, reduction=reduction)
         if self.param_vals["loss"]=="bce":
-            self.loss_fn = torch.nn.BCEWithLogitsLoss()
+            self.loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([3000/4000]).cuda())
 
     def get_input(self, batch):
         '''
         Returns X and y for each batch returned by a dataloader. 
         '''
         batch_size = self.param_vals.get('batch_size', 8)
-        num_targets = self.param_vals.get('num_targets', 1)
+        num_targets = self.num_targets #self.param_vals.get('num_targets', 1)
         seq_X,y = batch
+#         print (seq_X.shape, y.shape)
         # reshape the input into [batch_size, 4, seq_len] format
         X_reshape = torch.stack(torch.chunk(torch.transpose(seq_X.reshape(seq_X.shape[0]*seq_X.shape[1], 4), 1, 0), batch_size, dim=1)).type(torch.FloatTensor).cuda()
         # this can be replaces by drop_last=True parameter in the dataloaders to drop the batches in the last iteration for each epoch
@@ -393,7 +542,9 @@ class Trainer(nn.Module):
         '''
         Plots the predictions vs the true values. 
         '''
-        for i in range(num_targets):
+        if num_targets >= 6: 
+            num_targets_plot = 6
+        for i in range(num_targets_plot):
             ys = y[:, :, i].flatten().cpu().numpy()
             if self.mode == 'classification': 
                 preds = torch.sigmoid(out).cpu().detach().numpy()
@@ -595,9 +746,12 @@ class Trainer(nn.Module):
         Handles the precision and f1-score calculation
         '''
 
-        y_true, y_pred = y_true.cpu().detach().numpy().flatten().astype(int), torch.round(y_pred).cpu().detach().numpy().flatten().astype(int)
-        f1 = f1_score(y_true, y_pred, average='macro', zero_division=1)
-        pres = precision_score(y_true, y_pred, average='macro', zero_division=1)
+        y_true = y_true.cpu().detach().numpy().astype(int).flatten()
+#         y_pred = torch.round(y_pred).cpu().detach().numpy().flatten().astype(int)
+        y_pred_tag = torch.round(torch.sigmoid(y_pred)).cpu().detach().numpy().astype(int).flatten()
+
+        f1 = f1_score(y_true, y_pred_tag, average='binary', zero_division=0)
+        pres = precision_score(y_true, y_pred_tag, average='binary', zero_division=0)
         return pres, f1
         
     def calc_R_R2(self, y_true, y_pred, num_targets, device='cuda:0'):
